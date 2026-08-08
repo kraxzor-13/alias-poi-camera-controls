@@ -7,7 +7,9 @@ bl_info = {
     "description": (
         "Autodesk Alias-style viewport navigation: Alt+Shift+LMB "
         "raycasts onto geometry and tumbles about that Point of "
-        "Interest, Alt+Shift+MMB tracks, Alt+Shift+RMB dollies."
+        "Interest, Alt+Shift+MMB tracks, Alt+Shift+RMB dollies "
+        "(vertical drag) and azimuth-twists/rolls the camera "
+        "(horizontal drag)."
     ),
     "category": "3D View",
 }
@@ -112,6 +114,8 @@ class AliasPOICameraPreferences(bpy.types.AddonPreferences):
         name="Invert Tumble Vertical", default=True)
     invert_dolly: bpy.props.BoolProperty(
         name="Invert Dolly", default=False)
+    invert_twist: bpy.props.BoolProperty(
+        name="Invert Azimuth Twist", default=False)
 
     def draw(self, context):
         layout = self.layout
@@ -119,8 +123,10 @@ class AliasPOICameraPreferences(bpy.types.AddonPreferences):
         row = layout.row()
         row.prop(self, "invert_tumble_x")
         row.prop(self, "invert_tumble_y")
-        layout.label(text="Alt+Shift+RMB Dolly")
-        layout.prop(self, "invert_dolly")
+        layout.label(text="Alt+Shift+RMB Dolly (vertical) / Azimuth Twist (horizontal)")
+        row = layout.row()
+        row.prop(self, "invert_dolly")
+        row.prop(self, "invert_twist")
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +134,7 @@ class AliasPOICameraPreferences(bpy.types.AddonPreferences):
 # ---------------------------------------------------------------------------
 
 class VIEW3D_OT_alias_poi_navigate(bpy.types.Operator):
-    """Alias-style Alt+Shift tumble / track / dolly about a Point of Interest"""
+    """Alias-style Alt+Shift tumble / track / dolly / azimuth-twist about a Point of Interest"""
     bl_idname = "view3d.alias_poi_navigate"
     bl_label = "Alias POI Navigate"
     bl_options = {'BLOCKING'}
@@ -137,13 +143,16 @@ class VIEW3D_OT_alias_poi_navigate(bpy.types.Operator):
         items=[
             ('TUMBLE', "Tumble", "Orbit about the clicked Point of Interest"),
             ('TRACK', "Track", "Pan the view"),
-            ('DOLLY', "Dolly", "Zoom toward/away from the current pivot"),
+            ('DOLLY', "Dolly / Twist", "Vertical drag zooms toward/away "
+             "from the POI, horizontal drag azimuth-twists (rolls) the "
+             "camera around its view axis"),
         ]
     )
 
     TUMBLE_SENSITIVITY = 0.007
     TRACK_SENSITIVITY = 1.6
     DOLLY_SENSITIVITY = 0.004
+    TWIST_SENSITIVITY = 0.007
 
     def invoke(self, context, event):
         rv3d = context.region_data
@@ -195,8 +204,12 @@ class VIEW3D_OT_alias_poi_navigate(bpy.types.Operator):
             poi = _current_poi if _current_poi is not None else rv3d.view_location.copy()
             self._poi = poi
             self._orbit_eye = _eye_location(rv3d)
-            self._orbit_rotation = rv3d.view_rotation.copy()
+            self._start_orbit_rotation = rv3d.view_rotation.copy()
+            self._orbit_rotation = self._start_orbit_rotation.copy()
             self._orbit_distance = rv3d.view_distance
+            self._total_twist = 0.0
+            self._dolly_axis_lock = None
+            self._dolly_cum_delta = Vector((0.0, 0.0))
             _show_poi_marker(poi)
 
         context.window_manager.modal_handler_add(self)
@@ -282,27 +295,82 @@ class VIEW3D_OT_alias_poi_navigate(bpy.types.Operator):
         up = rv3d.view_rotation @ Vector((0.0, 1.0, 0.0))
         rv3d.view_location += (-right * delta.x + -up * delta.y) * scale
 
+    DOLLY_AXIS_LOCK_THRESHOLD = 4.0  # pixels of cumulative movement before committing to an axis
+
     def _dolly(self, context, rv3d, delta):
+        # Determine, once per drag, whether this gesture is a vertical
+        # zoom or a horizontal twist, then lock to that axis for the rest
+        # of the drag and ignore the other. Without this, ordinary hand
+        # tremor during an "up/down only" zoom drag still produces tiny
+        # nonzero horizontal deltas every frame, and since horizontal
+        # movement drives the twist, that jitter leaks in as an unwanted
+        # wobble/roll while the user is just trying to zoom (and vice
+        # versa for a twist drag picking up unwanted zoom).
+        self._dolly_cum_delta += delta
+        if self._dolly_axis_lock is None:
+            if self._dolly_cum_delta.length < self.DOLLY_AXIS_LOCK_THRESHOLD:
+                return
+            self._dolly_axis_lock = (
+                'TWIST' if abs(self._dolly_cum_delta.x) > abs(self._dolly_cum_delta.y) else 'ZOOM'
+            )
+            # Roll around the axis running through the eye and the POI (not
+            # the camera's own view-centre axis) so the POI is the fixed
+            # point of the twist - everything else swings around it,
+            # rather than the twist swinging POI around the screen centre.
+            axis = self._poi - self._orbit_eye
+            if axis.length_squared < 1e-10:
+                axis = self._start_orbit_rotation @ Vector((0.0, 0.0, -1.0))
+            self._twist_axis = axis.normalized()
+            self._twist_start_view_location = rv3d.view_location.copy()
+
+        if self._dolly_axis_lock == 'ZOOM':
+            delta = Vector((0.0, delta.y))
+        else:
+            delta = Vector((delta.x, 0.0))
+
         prefs = _get_prefs(context)
         sz = -1.0 if prefs.invert_dolly else 1.0
+        st = -1.0 if prefs.invert_twist else 1.0
+
+        # The twist total is accumulated as a scalar and re-applied to the
+        # frozen drag-start orientation each frame (same approach as
+        # tumble) rather than repeatedly multiplying the previous frame's
+        # result, so it doesn't drift over a long drag.
+        self._total_twist += st * delta.x * self.TWIST_SENSITIVITY
+        roll_q = Quaternion(self._twist_axis, self._total_twist)
+        self._orbit_rotation = (roll_q @ self._start_orbit_rotation).normalized()
+        rv3d.view_rotation = self._orbit_rotation
+
         factor = max(0.02, 1.0 - sz * delta.y * self.DOLLY_SENSITIVITY)
         forward = self._orbit_rotation @ Vector((0.0, 0.0, -1.0))
 
         if rv3d.view_perspective == 'ORTHO':
-            # Orthographic projection has no foreshortening, so translating
-            # the eye along the view axis (the PERSP approach below) is
-            # invisible - zoom has to scale view_distance directly, since
-            # that's what actually drives the ortho frustum width. To still
-            # converge on the POI rather than the screen centre, project
-            # the POI onto the current view plane and slide the pivot
-            # toward it by the same fraction the view is zooming in.
-            rv3d.view_distance = max(1e-4, rv3d.view_distance * factor)
-            poi_on_plane = self._poi - forward * forward.dot(self._poi - rv3d.view_location)
-            rv3d.view_location = rv3d.view_location.lerp(poi_on_plane, 1.0 - factor)
+            if self._dolly_axis_lock == 'TWIST':
+                # The eye lies exactly on the twist axis so it never moves
+                # (handled below, unaffected), but ortho has no "eye" -
+                # view_location is what needs to orbit around the POI to
+                # keep it fixed on screen while everything else swings
+                # around it.
+                rv3d.view_location = self._poi + roll_q @ (self._twist_start_view_location - self._poi)
+            else:
+                # Orthographic projection has no foreshortening, so
+                # translating the eye along the view axis (the PERSP
+                # approach below) is invisible - zoom has to scale
+                # view_distance directly, since that's what actually
+                # drives the ortho frustum width. To still converge on the
+                # POI rather than the screen centre, project the POI onto
+                # the current view plane and slide the pivot toward it by
+                # the same fraction the view is zooming in.
+                rv3d.view_distance = max(1e-4, rv3d.view_distance * factor)
+                poi_on_plane = self._poi - forward * forward.dot(self._poi - rv3d.view_location)
+                rv3d.view_location = rv3d.view_location.lerp(poi_on_plane, 1.0 - factor)
         else:
             # Move the eye toward/away from the POI directly, rather than
             # just shrinking view_distance (which zooms toward the screen
-            # centre, not necessarily the POI).
+            # centre, not necessarily the POI). During a twist-locked drag
+            # factor is exactly 1.0 (delta.y was zeroed above), so this is
+            # a no-op and the eye - which already lies on the twist axis -
+            # stays put, matching the ortho branch's behaviour.
             self._orbit_eye = self._poi + (self._orbit_eye - self._poi) * factor
             rv3d.view_location = self._orbit_eye + forward * self._orbit_distance
 
